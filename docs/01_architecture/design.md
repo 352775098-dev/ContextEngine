@@ -1105,24 +1105,210 @@ WHERE id = ? AND level = 'node';
 **处理流程**：
 
 ```
-接收压缩通知 → 压缩策略选择 → 读取对话数据 → 执行压缩 → 保存压缩数据 → 通知组装
+接收压缩通知 → 上下文内容识别 → 读取对话数据 → 执行压缩 → 保存压缩数据 → 通知组装
 ```
 
+#### 3.4.1 服务内部异步压缩流程图
+
+```mermaid
+flowchart TD
+    Source["触发模块<br/>数据变更管理模块"] --> API["上下文服务内部压缩接口"]
+    API --> Validate["参数校验 / 幂等校验"]
+    Validate --> Task["创建压缩任务"]
+    Task --> Queue["投递压缩任务队列"]
+    Queue --> Worker["上下文处理模块 Worker"]
+    Worker --> Load["加载实例配置、节点配置、上下文数据"]
+    Load --> Analyze["分析Token / 消息轮次 / 工具结果体积"]
+    Analyze --> Decide{"上下文内容识别"}
+    Decide --> |长对话历史|Summary["摘要生成"]
+    Decide --> |工具结果过多|KeyInfo["关键信息提取"]
+    Summary --> Assoc["关联对话生成，query和answer压缩成一句话"]
+    Summary --> Draft["摘要内容生成"]
+    Assoc --> LLM["模型服务"]
+
+    Draft --> SummaryMode{"压缩策略决策"}
+    SummaryMode -->|query+answer 都压缩| BothCompress["生成 query/answer 分别摘要"]
+    SummaryMode -->|仅 answer 压缩| AnswerCompress["生成 answer 摘要<br/>保留 query 原文"]
+    BothCompress --> LLM
+    AnswerCompress --> LLM
+    KeyInfo --> LLM
+    LLM --> Persist["落库压缩快照与当前版本"]
+    Persist --> Save["保存压缩结果与版本"]
+    Save --> Notify["通知上下文组装模块：压缩已完成"]
+```
+
+#### 3.4.2 服务内部接口设计
+
+上下文压缩需要提供服务内部异步接口给其他模块调用。接口只负责接收请求、完成参数校验和任务入队，真正的压缩处理由后台 Worker 异步执行。压缩完成后先保存压缩结果与版本信息，再通知上下文组装模块发起组装。
+
+**接口1：创建压缩任务**
+
+| 项目 | 说明 |
+|------|------|
+| **接口名称** | `CompressionTaskService.createTask` |
+| **调用方** | 上下文数据变更管理模块 |
+| **功能描述** | 创建一个上下文压缩任务，返回 `task_id`，后台异步执行 |
+
+**入参**
+
+| 参数名 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| instance_id | string | 是 | 需要压缩的上下文实例ID |
+| target_node_ids | array[string] | 否 | 指定压缩节点；为空表示按实例下全部可压缩节点处理 |
+| compression_trigger | string | 是 | 触发原因：`token_limit` / `message_count` / `tool_result_oversize` / `manual` / `session_close` |
+| preferred_strategy | string | 否 | 触发模块建议策略：`auto` / `summary` / `key_info`，默认 `auto` |
+| expected_target | object | 否 | 压缩目标，如 `max_tokens`、`max_turns`、`max_tool_payload_bytes` |
+| notify_targets | array[string] | 否 | 需要通知的内部模块列表，如 `context_assemble`、`data_change_mgr` |
+| idempotency_key | string | 否 | 幂等键，避免重复提交 |
+| operator | string | 否 | 操作人/触发来源标识，用于审计 |
+
+**入参示例**
+
+```json
+{
+  "instance_id": "inst_001",
+  "target_node_ids": ["node_llm_01"],
+  "compression_trigger": "token_limit",
+  "preferred_strategy": "auto",
+  "expected_target": {
+    "max_tokens": 12000,
+    "max_turns": 20
+  },
+  "notify_targets": ["context_assemble", "data_change_mgr"],
+  "idempotency_key": "compress-inst_001-node_llm_01-20260308T160000Z",
+  "operator": "data_change_mgr"
+}
+```
+
+**返回示例**
+
+```json
+{
+  "code": 0,
+  "message": "accepted",
+  "data": {
+    "task_id": "cmp_20260308_0001",
+    "instance_id": "inst_001",
+    "status": "queued",
+    "strategy_preview": "summary"
+  }
+}
+```
+
+#### 3.4.3 压缩完成通知机制
+
+压缩完成后必须通知对应的服务内模块。通知方式采用内部事件总线或进程内消息分发，不采用对外 Webhook。通知报文只传递“压缩完成”信号和必要元数据，不携带压缩后的上下文数据。
+
+**内部事件**
+
+| 项目 | 说明 |
+|------|------|
+| **分发方式** | 事件总线 / 任务队列 / 进程内发布订阅 |
+| **超时控制** | 单个订阅者处理超时默认 3 秒 |
+| **重试策略** | 指数退避 3 次：1s / 5s / 30s |
+| **失败处理** | 超过重试次数后进入死信队列或失败表 |
+
+**事件报文示例**
+
+```json
+{
+  "task_id": "cmp_20260308_0001",
+  "instance_id": "inst_001",
+  "status": "succeeded",
+  "compression_trigger": "token_limit",
+  "final_strategy": "summary",
+  "node_id": "node_llm_01",
+  "context_version": 12,
+  "snapshot_id": "ctx_snap_8891",
+  "assembly_type": "incremental",
+  "started_at": "2026-03-08T16:00:01Z",
+  "finished_at": "2026-03-08T16:00:03Z",
+  "trace_id": "trace_cmp_8891",
+  "failure_reason": ""
+}
+```
+
+**内部事件主题建议**
+
+| Topic | 用途 |
+|------|------|
+| `context.compression.requested` | 提交压缩任务 |
+| `context.compression.succeeded` | 压缩成功 |
+| `context.compression.failed` | 压缩失败 |
+| `context.compression.notify_failed` | 内部通知多次失败，进入死信处理 |
+
+#### 3.4.4 内部实现逻辑
+
+**步骤0：接收内部请求并创建任务**
+
+1. 内部压缩接口校验 `instance_id`、`compression_trigger`、`notify_targets`。
+2. 使用 `idempotency_key` 或 `(instance_id, target_node_ids, compression_trigger, status in queued/running)` 做去重。
+3. 创建压缩任务记录，初始状态为 `queued`。
+4. 将任务投递到压缩队列，返回 `task_id` 给触发模块。
+
 #### 步骤1：接收压缩通知
-接收来自数据变更管理模块的压缩请求，包含：
+接收来自数据变更管理模块、定时任务或手工触发入口的压缩请求，包含：
 - instance_id：需要压缩的实例ID
 - compression_trigger：触发原因（token_limit / message_count / manual）
 - target_node_ids：需要压缩的节点列表
 
-#### 步骤2：压缩策略选择
-根据 `context_instance.model_config` 中的配置选择压缩策略：
+建议新增任务表，保证异步执行、可重试和可审计：
+
+```sql
+CREATE TABLE context_compression_task (
+    task_id              VARCHAR(64) PRIMARY KEY,
+    instance_id          VARCHAR(64) NOT NULL,
+    target_node_ids      JSON NOT NULL,
+    compression_trigger  VARCHAR(32) NOT NULL,
+    preferred_strategy   VARCHAR(32) NOT NULL DEFAULT 'auto',
+    notify_targets       JSON NULL,
+    status               VARCHAR(32) NOT NULL,
+    metrics_snapshot     JSON NULL,
+    result_payload       JSON NULL,
+    failure_reason       TEXT NULL,
+    idempotency_key      VARCHAR(128) NULL,
+    created_at           TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at           TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+#### 步骤2：上下文内容识别
+根据 `context_instance.model_config`、触发模块传入参数和实时统计指标识别当前上下文更适合执行“摘要生成”还是“关键信息提取”：
 
 | 策略 | 适用场景 | 配置来源 |
 |------|----------|----------|
 | **摘要生成** | 长对话历史 | `workflow.nodes[].context_requirements.history_messages.max_tokens` |
-| **历史截断** | Token超限 | `workflow.nodes[].context_requirements.history_messages.max_turns` |
-| **向量化存储** | 需要语义检索 | memory_context 配置 |
 | **关键信息提取** | 工具结果过多 | 节点配置的 output_mapping |
+
+**识别优先级**
+
+1. 如果触发模块传入 `preferred_strategy != auto`，先校验该策略是否与节点能力兼容。
+2. 如果工具结果体积超限，优先执行 `key_info`。
+3. 如果当前节点以历史多轮对话为主，优先执行 `summary`。
+4. 如果同时存在长对话和工具结果冗余，优先执行 `summary`，并在摘要结果中补充关键事实。
+
+**识别伪代码**
+
+```cpp
+CompressionStrategy DecideStrategy(const std::string& preferred_strategy,
+                                   const CompressionMetrics& metrics,
+                                   const NodeConfig& node_config) {
+    if (preferred_strategy != "auto") {
+        return ValidateStrategy(preferred_strategy, node_config);
+    }
+
+    if (metrics.tool_payload_bytes > node_config.max_tool_payload_bytes) {
+        return CompressionStrategy::kKeyInfo;
+    }
+
+    if (metrics.total_tokens > node_config.max_tokens ||
+        metrics.message_turns > node_config.history_messages.max_turns) {
+        return CompressionStrategy::kSummary;
+    }
+
+    return CompressionStrategy::kNoop;
+}
+```
 
 #### 步骤3：读取对话数据
 从 RAG 服务查询待压缩数据：
@@ -1140,21 +1326,79 @@ FROM context_instance
 WHERE id = ? AND level = 'node';
 ```
 
+除了读取原始数据，还需要拉取以下信息用于策略决策：
+- 当前节点 `total_tokens`
+- 每轮消息的 token 分布
+- 工具结果大小、结构化字段分布
+- 上次压缩版本号和快照信息，避免重复压缩同一批数据
+- 节点是否允许丢弃原文，只保留摘要
+
 #### 步骤4：执行压缩
 根据选择的策略执行压缩：
 
 **4.1 摘要生成压缩**
-- 调用 LLM 服务生成对话摘要
-- 输入：原始对话消息列表
-- 输出：摘要文本 + 关键信息提取
+- 并行处理关联对话和摘要生成准备：
+  - 一路调用模型服务进行关联对话处理，识别需要一起压缩的上下文范围
+  - 一路基于当前 query、answer 生成摘要草稿
+- 分析节点配置，判断采用哪种摘要策略：
+  - `query_answer_summary`：query 和 answer 一起压缩
+  - `answer_only_summary`：仅压缩 answer，保留 query 原文
+- 汇总关联对话结果和摘要草稿后，调用 LLM 服务生成最终摘要
+- 输入：原始 query、answer、关联对话
+- 输出：摘要文本、query/answer 压缩范围、关键信息提取结果
 
-**4.2 历史截断**
-- 保留最近 N 轮对话（根据 `max_turns` 配置）
-- 早期对话存入归档表（如有需要）
+**4.2 关键信息提取**
+- 调用模型服务从工具结果、动态参数、历史响应中提取关键事实
+- 输出结构化 `key_facts`，供后续组装时使用
 
-**4.3 工具结果精简**
-- 保留工具调用关键字段（tool_id、status、关键output）
-- 移除详细输出中的冗余信息
+**4.3 无需压缩**
+- 若实时统计未超过阈值，任务直接标记为 `succeeded`
+- 结果中返回 `final_strategy = noop`
+
+**内部执行伪代码**
+
+```cpp
+void RunCompressionTask(const CompressionTask& task) {
+    MarkRunning(task.task_id);
+    auto nodes = LoadTargetNodes(task.instance_id, task.target_node_ids);
+    std::vector<CompressionResult> results;
+
+    for (const auto& node : nodes) {
+        auto ctx = LoadContext(node.id);
+        auto metrics = AnalyzeContext(ctx, node.model_config, task.expected_target);
+        auto strategy = DecideStrategy(task.preferred_strategy, metrics, node.model_config);
+
+        if (strategy == CompressionStrategy::kNoop) {
+            results.push_back(BuildNoopResult(node, metrics));
+            continue;
+        }
+
+        CompressionPayload compressed;
+        if (strategy == CompressionStrategy::kSummary) {
+            auto related_future = std::async(std::launch::async, [&]() {
+                return ResolveRelatedContextByLLM(node.id, ctx, node.model_config);
+            });
+            auto draft_future = std::async(std::launch::async, [&]() {
+                return BuildSummaryDraft(ctx, node.model_config);
+            });
+
+            auto related_context = related_future.get();
+            auto summary_draft = draft_future.get();
+            compressed = ExecuteSummaryStrategy(ctx, related_context, summary_draft, node.model_config);
+        } else if (strategy == CompressionStrategy::kKeyInfo) {
+            compressed = ExecuteKeyInfoStrategy(ctx, node.model_config);
+        }
+
+        auto snapshot_id = SaveCompressedSnapshot(node.id, ctx, compressed, strategy);
+        UpdateContextInstance(node.id, compressed);
+        SaveTaskNodeResult(task.task_id, node.id, compressed, strategy, snapshot_id);
+        PublishCompressionSucceeded(task.instance_id, node.id, snapshot_id, strategy);
+        results.push_back(BuildSuccessResult(node, metrics, compressed, strategy, snapshot_id));
+    }
+
+    FinalizeTask(task.task_id, results);
+}
+```
 
 #### 步骤5：保存压缩数据
 将压缩后的数据更新到数据库：
@@ -1169,18 +1413,112 @@ SET
 WHERE id = ?;
 ```
 
+为了支持回滚、审计和增量组装，建议不要直接覆盖原始数据，而是采用“当前态 + 快照”双写：
+
+```sql
+INSERT INTO context_compression_snapshot (
+    snapshot_id,
+    instance_id,
+    node_id,
+    strategy,
+    source_version,
+    compressed_payload,
+    metrics_before,
+    metrics_after,
+    created_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP);
+```
+
+保存阶段的关键动作：
+- 更新 `context_instance` 当前有效上下文和 `context_version`
+- 写入 `context_compression_snapshot`
+- 记录压缩前后指标：`before_tokens`、`after_tokens`、`before_turns`、`after_turns`
+- 若为 `summary`，保留 `summary_text`、`key_facts`、`summary_range`
+- 若为 `key_info`，记录结构化 `key_facts`
+
+保存压缩快照与当前版本完成后，继续执行以下动作：
+- 保存 `context_compression_task.result_payload`、节点级处理结果和版本信息
+- 保存成功后再发布 `context.compression.succeeded` 事件，通知上下文组装模块压缩已完成
+
 #### 步骤6：通知组装模块
 - 发送压缩完成通知给上下文组装模块
-- 携带压缩摘要信息，便于组装时选择使用原始数据还是压缩数据
+- 通知仅包含 `instance_id`、`node_id`、`context_version`、`snapshot_id`、`assembly_type`
+- 不携带压缩后的 `input_messages`、`tool_results`、`memory_vectors`、`key_facts`
+- 由上下文组装模块收到事件后按版本信息重新读取最新上下文数据并发起增量组装
 
-**压缩触发条件**：
+建议通知载荷：
 
-| 条件 | 阈值来源 | 检查时机 |
-|------|----------|----------|
-| Token数超限 | `model_config.max_tokens` | 每次写入后 |
-| 消息数超限 | `history_messages.max_turns` | 每次写入后 |
-| 会话结束时 | 节点状态变为 completed | 节点完成时 |
-| 手动触发 | API调用 | 按需 |
+```json
+{
+  "event_type": "context.compression.succeeded",
+  "instance_id": "inst_001",
+  "node_id": "node_llm_01",
+  "context_version": 12,
+  "snapshot_id": "ctx_snap_8891",
+  "final_strategy": "summary",
+  "assembly_type": "incremental"
+}
+```
+
+#### 3.4.5 通知触发模块详细逻辑
+
+1. 压缩快照和当前版本落库完成后，先保存任务结果和版本信息。
+2. 保存成功后，再向 `context_assemble` 发送压缩完成事件。
+3. `context_assemble` 订阅成功事件后，根据 `instance_id`、`node_id`、`context_version` 触发上下文组装。
+4. 如果订阅者处理超时或失败，则进入重试队列。
+5. 连续重试失败后，发布 `context.compression.notify_failed` 事件，并将任务标记为 `notify_failed` 子状态。
+6. 通知成功后更新任务状态中的 `notified_at`、`notify_result`，不影响已落库的压缩结果。
+
+#### 3.4.6 实现建议
+
+**模块拆分**
+
+| 组件 | 职责 |
+|------|------|
+| `CompressionController` | 提供创建压缩任务接口 |
+| `CompressionTaskService` | 任务创建、幂等、状态流转 |
+| `CompressionDecisionEngine` | 依据配置和实时指标识别压缩路径 |
+| `CompressionExecutor` | 执行 summary / key_info |
+| `CompressionRepository` | 读写上下文当前态、快照、任务表 |
+| `CompressionNotifyService` | 通知内部模块、发布事件、失败重试 |
+
+**接口伪代码**
+
+```cpp
+class CompressionController {
+public:
+    CreateCompressionTaskResponse CreateTask(const CreateCompressionTaskRequest& request);
+};
+
+class CompressionTaskService {
+public:
+    std::string CreateTask(const CreateCompressionTaskCommand& command);
+    void RunTask(const std::string& task_id);
+};
+
+class CompressionDecisionEngine {
+public:
+    CompressionStrategy Decide(const CompressionContext& context,
+                               const CompressionTarget& target) const;
+};
+
+class CompressionNotifyService {
+public:
+    void NotifyAssembler(const CompressionTask& task,
+                         const CompressionResult& result) const;
+};
+```
+
+**状态机建议**
+
+| 状态 | 说明 |
+|------|------|
+| `queued` | 已创建，待执行 |
+| `running` | 压缩中 |
+| `succeeded` | 全部节点压缩成功 |
+| `partial_succeeded` | 部分节点成功 |
+| `failed` | 压缩失败 |
+| `notify_failed` | 压缩成功，但通知内部模块失败 |
 
 ---
 
