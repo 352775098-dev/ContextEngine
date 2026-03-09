@@ -179,6 +179,112 @@ flowchart TD
 
 ---
 
+### 2.4 推荐代码目录结构
+
+基于 2.3 的整体流程图，代码目录建议按“接入层 -> 应用编排层 -> 领域能力层 -> 基础设施层”组织。这样可以保证调用链清晰，模块边界与流程图一致，同时便于后续拆分成独立服务或独立库。
+
+```text
+ContextEngine/
+├── CMakeLists.txt
+├── README.md
+├── docs/
+├── include/
+│   ├── api/
+│   │   ├── context_controller.h
+│   │   ├── request_dto.h
+│   │   └── response_dto.h
+│   ├── application/
+│   │   ├── instance/
+│   │   │   └── instance_app_service.h
+│   │   ├── write/
+│   │   │   └── context_write_app_service.h
+│   │   ├── query/
+│   │   │   └── context_query_app_service.h
+│   │   └── assemble/
+│   │       └── context_assemble_app_service.h
+│   ├── domain/
+│   │   ├── model/
+│   │   │   ├── context_instance.h
+│   │   │   ├── context_message.h
+│   │   │   └── context_snapshot.h
+│   │   ├── instance/
+│   │   │   └── instance_manager.h
+│   │   ├── change/
+│   │   │   └── data_change_manager.h
+│   │   ├── processing/
+│   │   │   ├── compression_service.h
+│   │   │   └── compression_strategy.h
+│   │   ├── assemble/
+│   │   │   ├── context_assembler.h
+│   │   │   ├── prompt_provider.h
+│   │   │   └── memory_retriever.h
+│   │   └── sync/
+│   │       └── cache_sync_service.h
+│   ├── infrastructure/
+│   │   ├── persistence/
+│   │   │   ├── context_repository.h
+│   │   │   └── snapshot_repository.h
+│   │   ├── llm/
+│   │   │   └── llm_client.h
+│   │   ├── rag/
+│   │   │   └── rag_client.h
+│   │   ├── workflow/
+│   │   │   └── workflow_loader.h
+│   │   ├── prompt/
+│   │   │   └── prompt_loader.h
+│   │   └── cache/
+│   │       └── agent_cache_gateway.h
+│   └── common/
+│       ├── error_code.h
+│       ├── result.h
+│       └── types.h
+├── src/
+│   ├── api/
+│   ├── application/
+│   ├── domain/
+│   ├── infrastructure/
+│   └── common/
+├── tests/
+│   ├── unit/
+│   ├── integration/
+│   └── e2e/
+└── examples/
+```
+
+**目录设计说明**：
+
+| 目录 | 对应流程图模块 | 设计说明 |
+|------|---------------|---------|
+| `api/` | API 网关模块 | 对外暴露实例管理、写入、查询接口；只做协议适配、参数校验、鉴权与返回封装 |
+| `application/instance` | 上下文实例管理模块 | 编排“创建实例 -> 加载 workflow -> 加载 prompt 和槽位”等流程，不承载底层存储细节 |
+| `application/write` | 上下文数据变更管理模块 | 编排写入请求、触发持久化、通知压缩与组装刷新 |
+| `application/query` | 查询入口 | 统一查询上下文、快照、组装结果，避免查询逻辑散落到 controller 或 repository |
+| `application/assemble` | 上下文组装模块 | 编排 prompt、动态参数、历史会话、记忆召回等组装流程 |
+| `domain/model` | 核心领域对象 | 沉淀实例、消息、快照、槽位等稳定业务模型 |
+| `domain/instance` | 上下文实例管理模块 | 放领域规则，如实例生命周期、状态流转、初始化约束 |
+| `domain/change` | 上下文数据变更管理模块 | 放写入校验、消息归档、版本推进等核心业务规则 |
+| `domain/processing` | 上下文处理模块 | 放压缩策略选择、压缩执行、压缩结果校验等能力 |
+| `domain/assemble` | 上下文组装模块 | 放组装规则、槽位填充规则、记忆与历史对话融合规则 |
+| `domain/sync` | 上下文缓存同步模块 | 放全量/增量同步规则、冲突处理与同步状态管理 |
+| `infrastructure/persistence` | RAG/存储依赖 | 负责上下文、快照、压缩结果等持久化实现 |
+| `infrastructure/llm` | 模型服务 | 封装压缩、摘要、改写等 LLM 调用 |
+| `infrastructure/rag` | RAG 服务 | 封装记忆检索、关联对话检索、向量查询等外部能力 |
+| `infrastructure/workflow` | workflow 加载 | 隔离 workflow 配置来源，避免实例管理模块依赖具体配置介质 |
+| `infrastructure/prompt` | prompt 加载 | 隔离 prompt 模板与上下文槽位配置来源 |
+| `infrastructure/cache` | Agent / SysAgent 缓存同步 | 负责和外部缓存模块交互，屏蔽传输协议细节 |
+| `common/` | 通用能力 | 放跨模块复用的错误码、返回结构、公共类型，避免污染领域层 |
+
+**落地原则**：
+
+1. `application` 只负责流程编排，不直接承载复杂业务规则，复杂规则应下沉到 `domain`。
+2. `domain` 不依赖具体 LLM、RAG、缓存协议实现，外部依赖统一经 `infrastructure` 注入。
+3. `api` 不直接操作 repository，而是只调用 `application`，保证入口层足够薄。
+4. `src/` 与 `include/` 保持镜像结构，便于 C++ 项目维护头文件暴露边界。
+5. `tests/unit` 主要覆盖 `domain`，`tests/integration` 覆盖 `application + infrastructure`，`tests/e2e` 覆盖整条流程链路。
+
+---
+
+
 ## 3. 模块详细设计
 
 ### 3.1 API网关模块
